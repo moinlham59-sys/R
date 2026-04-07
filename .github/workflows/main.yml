@@ -23,17 +23,19 @@ jobs:
           g++ \
           libcurl4-openssl-dev \
           libjsoncpp-dev \
-          cmake
+          pkg-config
 
     - name: Build bot
       run: |
         g++ -std=c++17 -O2 -pthread \
+          $(pkg-config --cflags jsoncpp) \
           -o bot bot.cpp \
-          -lcurl -ljsoncpp \
+          $(pkg-config --libs jsoncpp) \
+          -lcurl \
           -Wall -Wextra
 
     - name: Run bot
       run: |
         ./bot
       timeout-minutes: 5
-    
+      
