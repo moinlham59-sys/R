@@ -37,5 +37,5 @@ jobs:
     - name: Run bot
       run: |
         ./bot
-      timeout-minutes: 5
+      timeout-minutes: 60
       
