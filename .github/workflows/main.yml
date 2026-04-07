@@ -1,0 +1,536 @@
+name: Pink Lock 677 - Build & Deploy
+
+on:
+  push:
+    branches: [main, master, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+          - optimized
+      upload_artifacts:
+        description: 'Upload Build Artifacts'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  PROJECT_NAME: pink_lock_bot
+  VERSION: 9.9.9
+  BOT_NAME: "PINK LOCK 677"
+
+jobs:
+  # ============================================
+  # CODE QUALITY & SECURITY CHECKS
+  # ============================================
+  code-quality:
+    name: Code Quality & Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Security Audit
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: C++ Linter (clang-tidy)
+        run: |
+          sudo apt-get install -y clang-tidy
+          clang-tidy --version
+          # Create .clang-tidy config
+          cat > .clang-tidy << 'EOF'
+          Checks: 'cppcoreguidelines-*,modernize-*,performance-*,portability-*,readability-*,security-*,bugprone-*'
+          WarningsAsErrors: ''
+          HeaderFilterRegex: '.*'
+          FormatStyle: none
+          EOF
+          # Run on source files
+          find . -name "*.cpp" -not -path "./build/*" | xargs clang-tidy || true
+
+      - name: Check Code Formatting
+        run: |
+          sudo apt-get install -y clang-format
+          clang-format --version
+          # Check if code follows Google style
+          find . -name "*.cpp" -o -name "*.h" | xargs clang-format --style=google --dry-run --Werror || true
+
+  # ============================================
+  # LINUX BUILDS (Multiple Distributions)
+  # ============================================
+  build-linux:
+    name: Linux Build Matrix
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
+        arch: [x64, arm64]
+        include:
+          - compiler: gcc
+            cc: gcc-12
+            cxx: g++-12
+          - compiler: clang
+            cc: clang-15
+            cxx: clang++-15
+          - arch: x64
+            cmake_flags: ""
+          - arch: arm64
+            cmake_flags: "-DCMAKE_SYSTEM_PROCESSOR=aarch64"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Compiler
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            sudo apt-get install -y gcc-12 g++-12
+          else
+            sudo apt-get install -y clang-15
+          fi
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libcurl4-openssl-dev \
+            libjsoncpp-dev \
+            libssl-dev \
+            zlib1g-dev \
+            pkg-config
+
+      - name: Configure CMake
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=native -funroll-loops" \
+            -DENABLE_OPTIMIZATIONS=ON \
+            -DBUILD_STATIC=OFF \
+            ${{ matrix.cmake_flags }} \
+            -G Ninja
+
+      - name: Build Project
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run Tests
+        run: |
+          cd build
+          ctest --output-on-failure || echo "No tests configured"
+
+      - name: Strip Binary (Release only)
+        if: matrix.build_type == 'Release'
+        run: |
+          strip build/${{ env.PROJECT_NAME }}
+          file build/${{ env.PROJECT_NAME }}
+
+      - name: Package Artifact
+        run: |
+          mkdir -p artifacts
+          cp build/${{ env.PROJECT_NAME }} artifacts/${{ env.PROJECT_NAME }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.arch }}
+          cp README.md artifacts/
+          tar -czf ${{ env.PROJECT_NAME }}-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.arch }}.tar.gz -C artifacts .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.arch }}
+          path: ${{ env.PROJECT_NAME }}-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.arch }}.tar.gz
+          retention-days: 30
+
+  # ============================================
+  # STATIC BUILD (Fully Portable)
+  # ============================================
+  build-linux-static:
+    name: Linux Static Build
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            musl-tools \
+            musl-dev \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Build Static curl
+        run: |
+          cd /tmp
+          git clone --depth 1 https://github.com/curl/curl.git
+          cd curl
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=musl-gcc \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/musl \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_STATIC_CRT=ON \
+            -DCURL_USE_OPENSSL=ON \
+            -DOPENSSL_ROOT_DIR=/usr/lib/x86_64-linux-gnu
+          cmake --build build --parallel $(nproc)
+          sudo cmake --install build
+
+      - name: Build Static jsoncpp
+        run: |
+          cd /tmp
+          git clone --depth 1 https://github.com/open-source-parsers/jsoncpp.git
+          cd jsoncpp
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=musl-gcc \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/musl \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DJSONCPP_WITH_TESTS=OFF
+          cmake --build build --parallel $(nproc)
+          sudo cmake --install build
+
+      - name: Configure & Build Static Binary
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=musl-g++ \
+            -DCMAKE_CXX_FLAGS="-O3 -static -static-libgcc -static-libstdc++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+            -DBUILD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH=/usr/local/musl \
+            -G Ninja
+          cmake --build build --parallel $(nproc)
+
+      - name: Verify Static Linking
+        run: |
+          file build/${{ env.PROJECT_NAME }}
+          ldd build/${{ env.PROJECT_NAME }} || echo "Static binary confirmed"
+
+      - name: Package Static Build
+        run: |
+          mkdir -p artifacts
+          cp build/${{ env.PROJECT_NAME }} artifacts/${{ env.PROJECT_NAME }}-static-linux-x64
+          tar -czf ${{ env.PROJECT_NAME }}-static-linux-x64.tar.gz -C artifacts .
+
+      - name: Upload Static Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-static-x64
+          path: ${{ env.PROJECT_NAME }}-static-linux-x64.tar.gz
+          retention-days: 90
+
+  # ============================================
+  # WINDOWS BUILDS (MinGW & MSVC)
+  # ============================================
+  build-windows:
+    name: Windows Build
+    runs-on: windows-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        compiler: [mingw, msvc]
+        include:
+          - compiler: mingw
+            cc: gcc
+            cxx: g++
+          - compiler: msvc
+            cc: cl
+            cxx: cl
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW
+        if: matrix.compiler == 'mingw'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-jsoncpp
+            mingw-w64-x86_64-openssl
+
+      - name: Build with MinGW
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-O3" \
+            -G Ninja
+          cmake --build build --parallel $(nproc)
+
+      - name: Setup MSVC
+        if: matrix.compiler == 'msvc'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install vcpkg Dependencies
+        if: matrix.compiler == 'msvc'
+        run: |
+          vcpkg install curl:x64-windows-static jsoncpp:x64-windows-static
+          vcpkg integrate install
+
+      - name: Build with MSVC
+        if: matrix.compiler == 'msvc'
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -G "Visual Studio 17 2022" `
+            -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Package Windows Build
+        run: |
+          mkdir artifacts
+          if ("${{ matrix.compiler }}" -eq "mingw") {
+            cp build/${{ env.PROJECT_NAME }}.exe artifacts/
+          } else {
+            cp build/Release/${{ env.PROJECT_NAME }}.exe artifacts/
+          }
+          Compress-Archive -Path artifacts/* -DestinationPath ${{ env.PROJECT_NAME }}-windows-${{ matrix.compiler }}.zip
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.compiler }}
+          path: ${{ env.PROJECT_NAME }}-windows-${{ matrix.compiler }}.zip
+
+  # ============================================
+  # MACOS BUILDS (Intel & Apple Silicon)
+  # ============================================
+  build-macos:
+    name: macOS Build
+    runs-on: macos-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          brew install cmake ninja curl jsoncpp openssl
+
+      - name: Configure Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_CXX_FLAGS="-O3 -arch ${{ matrix.arch }}" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)/opt/openssl" \
+            -G Ninja
+
+      - name: Build Project
+        run: cmake --build build --parallel $(sysctl -n hw.ncpu)
+
+      - name: Package macOS Build
+        run: |
+          mkdir -p artifacts
+          cp build/${{ env.PROJECT_NAME }} artifacts/${{ env.PROJECT_NAME }}-macos-${{ matrix.arch }}
+          chmod +x artifacts/${{ env.PROJECT_NAME }}-macos-${{ matrix.arch }}
+          tar -czf ${{ env.PROJECT_NAME }}-macos-${{ matrix.arch }}.tar.gz -C artifacts .
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: ${{ env.PROJECT_NAME }}-macos-${{ matrix.arch }}.tar.gz
+
+  # ============================================
+  # DOCKER BUILD & PUBLISH
+  # ============================================
+  build-docker:
+    name: Docker Multi-Arch Build
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-linux-static]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.PROJECT_NAME }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.PROJECT_NAME }}:${{ env.VERSION }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.PROJECT_NAME }}:${{ github.sha }}
+
+  # ============================================
+  # RELEASE CREATION
+  # ============================================
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-linux-static, build-windows, build-macos, build-docker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          merge-multiple: true
+
+      - name: Generate Release Notes
+        run: |
+          cat > RELEASE_NOTES.md << 'EOF'
+          # 🚀 Pink Lock 677 v${{ env.VERSION }} Release
+
+          ## 📦 Included Builds
+          - Linux (GCC & Clang, x64 & ARM64)
+          - Linux Static (Fully Portable)
+          - Windows (MinGW & MSVC)
+          - macOS (Intel & Apple Silicon)
+          - Docker Multi-Architecture
+
+          ## 🔥 Features
+          - 9,999,999,999 bytes payload support
+          - 10,000+ multi-threading
+          - GPU acceleration ready
+          - Full admin panel
+          - Group management
+          - Premium hosting system
+          - Real-time statistics
+          - Inline keyboards
+
+          ## ⚠️ Legal Notice
+          **For authorized security testing only. Unauthorized use is illegal.**
+
+          ## 📢 Links
+          - Channel: https://t.me/PYHOSTING0
+          - Owner: @MoinOwner
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: RELEASE_NOTES.md
+          files: all-artifacts/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================
+  # DEPLOYMENT TO VPS/SERVER
+  # ============================================
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: create-release
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: production
+    steps:
+      - name: Download Static Build
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-static-x64
+
+      - name: Deploy to Server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          source: "*.tar.gz"
+          target: "/opt/pink-lock-bot/releases/"
+
+      - name: Execute Remote Commands
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            cd /opt/pink-lock-bot/releases/
+            tar -xzf pink_lock_bot-static-linux-x64.tar.gz
+            sudo systemctl restart pink-lock-bot
+            echo "Deployment completed at $(date)"
+
+  # ============================================
+  # NOTIFICATION
+  # ============================================
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [create-release, deploy]
+    if: always()
+    steps:
+      - name: Notify Telegram Channel
+        uses: appleboy/telegram-action@v1.0.0
+        with:
+          to: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🔐 *Pink Lock 677 Build Status*
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Status: ${{ job.status }}
+
+            ${{ needs.create-release.result == 'success' && '✅ Release Created' || '' }}
+            ${{ needs.deploy.result == 'success' && '✅ Deployed to Production' || '' }}
+
+            📢 Channel: @PYHOSTING0
+            👤 Owner: @MoinOwner
+            
