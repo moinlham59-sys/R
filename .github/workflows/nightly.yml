@@ -1,0 +1,26 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM daily
+  workflow_dispatch:
+
+jobs:
+  nightly-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build Nightly
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libjsoncpp-dev
+          g++ -std=c++17 -O3 -pthread -lcurl -ljsoncpp pink_lock_bot.cpp -o pink_lock_bot-nightly
+      
+      - name: Upload Nightly
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-build
+          path: pink_lock_bot-nightly
+          retention-days: 7
+          
